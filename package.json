@@ -1,0 +1,29 @@
+{
+  "name": "mudhra_pay_upi_core",
+  "version": "1.0.0",
+  "description": "A high-integrity financial backend replicating the core mechanics of an Indian UPI TPAP/Switch and Core Banking Ledger.",
+  "main": "index.js",
+  "directories": {
+    "test": "tests"
+  },
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ansh2050/Mudhra_pay_upi_core.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "bugs": {
+    "url": "https://github.com/ansh2050/Mudhra_pay_upi_core/issues"
+  },
+  "homepage": "https://github.com/ansh2050/Mudhra_pay_upi_core#readme",
+  "dependencies": {
+    "dotenv": "^18.0.10",
+    "express": "^5.3.0",
+    "pg": "^8.23.1"
+  }
+}
