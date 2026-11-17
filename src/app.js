@@ -6,12 +6,12 @@ const errorHandler = require('./middlewares/error.middleware');
 
 const app = express();
 
+app.use(express.json());
+
 // ---------------------------------------------------------------------------
-// BigInt → string serialization for JSON responses
+// BigInt → string serialization for JSON responses (placed after express.json())
 // ---------------------------------------------------------------------------
 app.set('json replacer', (k, v) => (typeof v === 'bigint' ? v.toString() : v));
-
-app.use(express.json());
 
 // ---------------------------------------------------------------------------
 // Health check

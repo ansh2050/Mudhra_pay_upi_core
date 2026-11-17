@@ -1,19 +1,19 @@
 'use strict';
 
 const { Router } = require('express');
-const { authenticate } = require('../middleware/auth');
-const { verifyMpin } = require('../services/auth/mpin');
+const { authenticate } = require('../middlewares/auth.middleware');
+const { requireMpin } = require('../middlewares/mpin.middleware');
 const { idempotencyMiddleware } = require('../middlewares/idempotency');
-const { executeJournalTransfer, LedgerError } = require('../modules/ledger-core/ledger.service');
+const { executeJournalTransfer } = require('../modules/ledger-core/ledger.service');
 
 const router = Router();
 
 // POST /api/v1/ledger/transfer
-// Pipeline: authenticate → verifyMpin → idempotencyMiddleware → handler
+// Middleware order: authenticate -> requireMpin -> idempotencyMiddleware -> handler
 router.post(
   '/',
   authenticate,
-  verifyMpin,
+  requireMpin,
   idempotencyMiddleware,
   async (req, res, next) => {
     try {
@@ -29,7 +29,7 @@ router.post(
       const result = await executeJournalTransfer({
         debitAccountId,
         creditAccountId,
-        amountPaise: typeof amountPaise === 'string' ? amountPaise : amountPaise,
+        amountPaise,
         journalType,
         createdByUserId: req.user.id,
         idempotencyKeyId: req.idempotencyKeyId || null,
