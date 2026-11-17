@@ -1,14 +1,34 @@
 'use strict';
 
-const { pool, closePool } = require('../src/config/db');
+const crypto = require('crypto');
+const { pool, query, closePool } = require('../src/config/db');
 const { executeJournalTransfer, LedgerError } = require('../src/modules/ledger-core/ledger.service');
-const { SEED_IDS } = require('./seed');
+
+// ============================================================================
+// HELPER: Create throwaway accounts per run (no seed dependency)
+// ============================================================================
+async function createThrowawayUser() {
+  const id = crypto.randomUUID();
+  await query('INSERT INTO users (id) VALUES ($1)', [id]);
+  return id;
+}
+
+async function createThrowawayAccount({ type = 'USER_SAVINGS', balance = 0n, userId } = {}) {
+  const owner = userId || (await createThrowawayUser());
+  const id = crypto.randomUUID();
+  await query(
+    `INSERT INTO accounts (id, user_id, type, cached_balance_paise, status)
+     VALUES ($1, $2, $3, $4, 'ACTIVE')`,
+    [id, owner, type, balance.toString()]
+  );
+  return { id, userId: owner };
+}
 
 // ============================================================================
 // HELPER: Asserts SUM(Credits) - SUM(Debits) === 0 across the entire ledger
 // ============================================================================
 async function assertZeroSum(stepName) {
-  const res = await pool.query(`
+  const res = await query(`
     SELECT COALESCE(SUM(CASE WHEN direction = 'CREDIT' THEN amount_paise ELSE -amount_paise END), 0)::BIGINT AS net_sum
     FROM ledger_entries
   `);
@@ -44,56 +64,59 @@ async function verifyLedger() {
   console.log('   8 test groups · 16 sub-tests · zero-sum after every step\n');
 
   try {
-    // ------------------------------------------------------------------------
-    // PRE-TEST: Check daily transaction count and warn if approaching limit
-    // ------------------------------------------------------------------------
-    const dailyCountRes = await pool.query(
-      `SELECT COUNT(*)::BIGINT AS count
-       FROM ledger_entries le
-       INNER JOIN journal_transactions jt ON jt.id = le.journal_id
-       WHERE le.account_id = $1
-         AND le.direction = 'DEBIT'
-         AND jt.status = 'COMPLETED'
-         AND jt.type IN ('P2P_TRANSFER', 'QR_MERCHANT_PAY', 'COLLECT_TRANSFER')
-         AND le.created_at >= date_trunc('day', CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Kolkata') AT TIME ZONE 'Asia/Kolkata'`,
-      [SEED_IDS.ANSH_ACCOUNT_ID]
-    );
-    const anshDailyCount = dailyCountRes.rows[0].count;
-    if (anshDailyCount >= 15n) {
-      console.log(`⚠️  WARNING: Ansh already has ${anshDailyCount} debits today (limit: 20).`);
-      console.log(`   Test 1 uses enforceDailyLimit: true. If close to limit, tests may fail.`);
-      console.log(`   To reset: docker compose down -v && docker compose up -d && node scripts/migrate.js && node scripts/seed.js\n`);
-    } else {
-      console.log(`ℹ️  Ansh has ${anshDailyCount} debits today. Safe to run tests.\n`);
-    }
+    // Create fresh throwaway accounts for this run
+    const vault = await createThrowawayAccount({ type: 'SYSTEM_SETTLEMENT_VAULT', balance: 100_000_000_00n });
+    const admin = await createThrowawayUser();
+    const ansh = await createThrowawayAccount();
+    const rahul = await createThrowawayAccount();
+
+    // Fund Ansh and Rahul via vault deposits (₹10,000 each)
+    const TARGET_BALANCE = 10_000_00n;
+    await executeJournalTransfer({
+      debitAccountId: vault.id,
+      creditAccountId: ansh.id,
+      amountPaise: TARGET_BALANCE,
+      journalType: 'DEPOSIT',
+      createdByUserId: admin,
+      referenceNote: 'Verify-ledger: fund Ansh',
+    });
+    await executeJournalTransfer({
+      debitAccountId: vault.id,
+      creditAccountId: rahul.id,
+      amountPaise: TARGET_BALANCE,
+      journalType: 'DEPOSIT',
+      createdByUserId: admin,
+      referenceNote: 'Verify-ledger: fund Rahul',
+    });
+    console.log('ℹ️  Throwaway accounts funded. Ready to test.\n');
 
     // ========================================================================
     // TEST 1: Valid P2P Transfer (Ansh → Rahul ₹500)
     // ========================================================================
     console.log('▶ Test 1: P2P Transfer');
     const tx = await executeJournalTransfer({
-      debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-      creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+      debitAccountId: ansh.id,
+      creditAccountId: rahul.id,
       amountPaise: 500_00n,
       journalType: 'P2P_TRANSFER',
-      createdByUserId: SEED_IDS.ANSH_USER_ID,
+      createdByUserId: ansh.userId,
       referenceNote: 'Smoke test P2P lunch split',
     });
     await assertZeroSum('Test 1: P2P Transfer');
     console.log(`  ✅ P2P ₹500 succeeded — journal: ${tx.journalId}`);
-    console.log(`     Ansh: ${tx.senderClosingBalancePaise.toString()} paise | Rahul: ${tx.receiverClosingBalancePaise.toString()} paise\n`);
+    console.log(`     Ansh: ${tx.senderClosingBalancePaise} paise | Rahul: ${tx.receiverClosingBalancePaise} paise\n`);
 
     // ========================================================================
     // TEST 2: Full Atomic Reversal / Refund (Rahul → Ansh ₹500)
     // ========================================================================
     console.log('▶ Test 2: Atomic Reversal');
     const rev = await executeJournalTransfer({
-      debitAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
-      creditAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
+      debitAccountId: rahul.id,
+      creditAccountId: ansh.id,
       amountPaise: 500_00n,
       journalType: 'REVERSAL',
       reversalOfId: tx.journalId,
-      createdByUserId: SEED_IDS.RAHUL_USER_ID,
+      createdByUserId: admin,
       referenceNote: 'Full refund of smoke test transfer',
     });
     await assertZeroSum('Test 2: Reversal');
@@ -106,11 +129,11 @@ async function verifyLedger() {
     console.log('▶ Test 3: Overdraft Rejection');
     await expectError('3a: Overdraft blocked', 'INSUFFICIENT_FUNDS', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: rahul.id,
         amountPaise: 999_999_00n,
         journalType: 'P2P_TRANSFER',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
         referenceNote: 'Should fail - overdraft',
       })
     );
@@ -123,11 +146,11 @@ async function verifyLedger() {
     console.log('▶ Test 4: Self-Transfer Rejection');
     await expectError('4a: Self-transfer blocked', 'SELF_TRANSFER_NOT_ALLOWED', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: ansh.id,
         amountPaise: 100_00n,
         journalType: 'P2P_TRANSFER',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
         referenceNote: 'Should fail - self transfer',
       })
     );
@@ -136,7 +159,6 @@ async function verifyLedger() {
 
     // ========================================================================
     // TEST 5: Bidirectional Concurrent Transfers (Edge Case A3)
-    // Uses enforceDailyLimit: false — testing concurrency, not velocity
     // ========================================================================
     console.log('▶ Test 5: Bidirectional Concurrency (6 simultaneous transfers)');
     const concurrentPromises = [];
@@ -144,13 +166,12 @@ async function verifyLedger() {
       const isAnshToRahul = i % 2 === 0;
       concurrentPromises.push(
         executeJournalTransfer({
-          debitAccountId: isAnshToRahul ? SEED_IDS.ANSH_ACCOUNT_ID : SEED_IDS.RAHUL_ACCOUNT_ID,
-          creditAccountId: isAnshToRahul ? SEED_IDS.RAHUL_ACCOUNT_ID : SEED_IDS.ANSH_ACCOUNT_ID,
+          debitAccountId: isAnshToRahul ? ansh.id : rahul.id,
+          creditAccountId: isAnshToRahul ? rahul.id : ansh.id,
           amountPaise: 100_00n,
           journalType: 'P2P_TRANSFER',
-          createdByUserId: isAnshToRahul ? SEED_IDS.ANSH_USER_ID : SEED_IDS.RAHUL_USER_ID,
+          createdByUserId: isAnshToRahul ? ansh.userId : rahul.userId,
           referenceNote: `Concurrency test #${i + 1}`,
-          enforceDailyLimit: false, // ← Don't increment daily count (testing deadlocks, not velocity)
         })
       );
     }
@@ -221,66 +242,66 @@ async function verifyLedger() {
     await expectError('7a: Invalid UUID', 'INVALID_ACCOUNT_ID', () =>
       executeJournalTransfer({
         debitAccountId: 'not-a-uuid',
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        creditAccountId: rahul.id,
         amountPaise: 100_00n,
         journalType: 'P2P_TRANSFER',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
       })
     );
 
     // 7b: Invalid journalType
     await expectError('7b: Invalid journalType', 'INVALID_JOURNAL_TYPE', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: rahul.id,
         amountPaise: 100_00n,
         journalType: 'HACK',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
       })
     );
 
     // 7c: Zero amount
     await expectError('7c: Zero amount', 'INVALID_AMOUNT', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: rahul.id,
         amountPaise: 0n,
         journalType: 'P2P_TRANSFER',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
       })
     );
 
     // 7d: Float amount
     await expectError('7d: Float amount', 'INVALID_AMOUNT', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: rahul.id,
         amountPaise: 10.999,
         journalType: 'P2P_TRANSFER',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
       })
     );
 
     // 7e: Too-long reference note (> 500 chars)
     await expectError('7e: Note too long', 'NOTE_TOO_LONG', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: rahul.id,
         amountPaise: 100_00n,
         journalType: 'P2P_TRANSFER',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
         referenceNote: 'x'.repeat(501),
       })
     );
 
     // 7f: Non-vault account trying to send DEPOSIT
-    await expectError('7f: Non-vault DEPOSIT', 'INVALID_DEPOSIT_SENDER', () =>
+    await expectError('7f: Non-vault DEPOSIT', 'INVALID_SENDER_TYPE', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+        debitAccountId: ansh.id,
+        creditAccountId: rahul.id,
         amountPaise: 100_00n,
         journalType: 'DEPOSIT',
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: ansh.userId,
       })
     );
 
@@ -294,61 +315,59 @@ async function verifyLedger() {
 
     // Create a fresh transfer specifically for reversal edge case testing
     const edgeTx = await executeJournalTransfer({
-      debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
-      creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
+      debitAccountId: ansh.id,
+      creditAccountId: rahul.id,
       amountPaise: 100_00n,
       journalType: 'P2P_TRANSFER',
-      createdByUserId: SEED_IDS.ANSH_USER_ID,
+      createdByUserId: ansh.userId,
       referenceNote: 'Reversal edge case base transfer',
-      enforceDailyLimit: false,
     });
     console.log(`  ℹ️  Created edge-case test transfer: ${edgeTx.journalId}`);
 
     // 8a: Reversal with WRONG accounts (same direction as original, not flipped)
     await expectError('8a: Wrong accounts', 'REVERSAL_ACCOUNT_MISMATCH', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.ANSH_ACCOUNT_ID,     // Should be Rahul (original receiver)
-        creditAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,  // Should be Ansh (original sender)
+        debitAccountId: ansh.id,         // Should be Rahul (original receiver)
+        creditAccountId: rahul.id,       // Should be Ansh (original sender)
         amountPaise: 100_00n,
         journalType: 'REVERSAL',
         reversalOfId: edgeTx.journalId,
-        createdByUserId: SEED_IDS.ANSH_USER_ID,
+        createdByUserId: admin,
       })
     );
 
     // 8b: Reversal with WRONG amount (partial refund)
     await expectError('8b: Wrong amount', 'REVERSAL_AMOUNT_MISMATCH', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
+        debitAccountId: rahul.id,
+        creditAccountId: ansh.id,
         amountPaise: 50_00n,  // Should be 100_00n
         journalType: 'REVERSAL',
         reversalOfId: edgeTx.journalId,
-        createdByUserId: SEED_IDS.RAHUL_USER_ID,
+        createdByUserId: admin,
       })
     );
 
     // 8c: Valid reversal (so we can test double-reversal next)
     const edgeRev = await executeJournalTransfer({
-      debitAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
-      creditAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
+      debitAccountId: rahul.id,
+      creditAccountId: ansh.id,
       amountPaise: 100_00n,
       journalType: 'REVERSAL',
       reversalOfId: edgeTx.journalId,
-      createdByUserId: SEED_IDS.RAHUL_USER_ID,
-      enforceDailyLimit: false,
+      createdByUserId: admin,
     });
     console.log(`  ✅ 8c: Valid reversal succeeded: ${edgeRev.journalId}`);
 
     // 8d: Try to reverse the SAME transaction again (should get ALREADY_REVERSED)
     await expectError('8d: Double reversal', 'ALREADY_REVERSED', () =>
       executeJournalTransfer({
-        debitAccountId: SEED_IDS.RAHUL_ACCOUNT_ID,
-        creditAccountId: SEED_IDS.ANSH_ACCOUNT_ID,
+        debitAccountId: rahul.id,
+        creditAccountId: ansh.id,
         amountPaise: 100_00n,
         journalType: 'REVERSAL',
         reversalOfId: edgeTx.journalId,
-        createdByUserId: SEED_IDS.RAHUL_USER_ID,
+        createdByUserId: admin,
       })
     );
 

@@ -2,42 +2,61 @@
 
 const fs = require('fs');
 const path = require('path');
-const { pool, closePool } = require('../src/config/db');
+const { Pool } = require('pg');
 
-async function runMigration() {
+async function runMigrations() {
   console.log('🚀 Starting Mudhra_pay database migration...');
 
-  // 1. Resolve and verify migration file path explicitly
-  const sqlPath = path.join(__dirname, '..', 'migrations', '001_initial_schema.sql');
-  
-  if (!fs.existsSync(sqlPath)) {
-    console.error(`❌ FATAL: Migration file not found at expected path: ${sqlPath}`);
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    console.error('❌ FATAL: DATABASE_URL environment variable is required.');
     process.exit(1);
   }
 
-  const sql = fs.readFileSync(sqlPath, 'utf8');
-  console.log(`⏳ Applying migration: ${path.basename(sqlPath)}...`);
+  const pool = new Pool({ connectionString });
 
   try {
-    // 2. Execute SQL migration against Docker PostgreSQL
-    await pool.query(sql);
-    console.log('✅ Migration 001_initial_schema.sql applied successfully!');
-  } catch (err) {
-    // PostgreSQL error codes for duplicate objects/tables
-    if (err.code === '42710' || err.code === '42P07') {
-      console.log('ℹ️ Schema objects already exist in database. (To reset cleanly, run: docker compose down -v && docker compose up -d)');
-    } else {
-      console.error('❌ Migration failed with PostgreSQL error:', err.code, '-', err.message);
-      process.exitCode = 1;
+    // Read all .sql files in migrations/, sorted alphabetically (000, 001, 002, 003, ...).
+    const migrationsDir = path.join(__dirname, '..', 'migrations');
+    const files = fs.readdirSync(migrationsDir)
+      .filter((f) => f.endsWith('.sql'))
+      .sort();
+
+    if (files.length === 0) {
+      console.error('❌ No .sql migration files found in', migrationsDir);
+      process.exit(1);
     }
+
+    for (const file of files) {
+      const sqlPath = path.join(migrationsDir, file);
+      const sql = fs.readFileSync(sqlPath, 'utf8');
+      console.log(`⏳ Applying migration: ${file}...`);
+
+      try {
+        // Each .sql as ONE query() call. Never split on ';' (breaks $$ blocks).
+        // No BEGIN/COMMIT of our own — PostgreSQL wraps a single query() in an
+        // implicit transaction already.
+        await pool.query(sql);
+        console.log(`✅ ${file} applied successfully.`);
+      } catch (err) {
+        // PostgreSQL error codes for duplicate objects/tables — idempotent re-runs
+        if (err.code === '42710' || err.code === '42P07') {
+          console.log(`ℹ️  ${file}: schema objects already exist (skipped).`);
+        } else {
+          console.error(`❌ ${file} failed:`, err.code, '-', err.message);
+          process.exitCode = 1;
+          return; // stop on first real error
+        }
+      }
+    }
+
+    console.log('🎉 All migrations applied.');
   } finally {
-    // 3. Guarantee pool cleanup
-    await closePool();
+    await pool.end();
   }
 }
 
-// Global async catch boundary to ensure it never exits silently
-runMigration().catch((err) => {
+runMigrations().catch((err) => {
   console.error('❌ Unhandled fatal error during migration:', err);
   process.exit(1);
 });
