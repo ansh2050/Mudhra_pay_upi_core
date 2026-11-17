@@ -6,7 +6,7 @@ const request = require('supertest');
 const express = require('express');
 const crypto = require('crypto');
 const { pool, query } = require('../src/config/db');
-const { idempotencyMiddleware, computeRequestHash } = require('../src/middlewares/idempotency');
+const { idempotencyMiddleware, computeRequestHash } = require('../src/middlewares/idempotency.middleware');
 const { createUser } = require('./helpers/fixtures');
 
 const TEST_USER = crypto.randomUUID(); // throwaway user for this file; every test uses a unique key

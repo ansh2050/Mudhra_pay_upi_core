@@ -6,10 +6,13 @@ const errorHandler = require('./middlewares/error.middleware');
 
 const app = express();
 
+// ---------------------------------------------------------------------------
+// express.json() registered before routes
+// ---------------------------------------------------------------------------
 app.use(express.json());
 
 // ---------------------------------------------------------------------------
-// BigInt → string serialization for JSON responses (placed after express.json())
+// BigInt → string serialization for JSON responses
 // ---------------------------------------------------------------------------
 app.set('json replacer', (k, v) => (typeof v === 'bigint' ? v.toString() : v));
 
@@ -28,9 +31,9 @@ app.get('/admin/metrics', (_req, res) => {
 });
 
 // ---------------------------------------------------------------------------
-// Ledger transfer route (Role 1)
+// Exactly one money-moving endpoint (Role 3: UPI Switch)
 // ---------------------------------------------------------------------------
-app.use('/api/v1/ledger/transfer', require('./routes/transfers'));
+app.use('/api/v1/ledger/transfer', require('./modules/upi-switch/upi.routes'));
 
 // ---------------------------------------------------------------------------
 // 404 catch-all

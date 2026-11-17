@@ -11,6 +11,7 @@
     "migrate": "node scripts/migrate.js",
     "seed": "node scripts/seed.js",
     "verify": "node scripts/verify-ledger.js",
+    "cleanup:idempotency": "node scripts/cleanup-idempotency.js",
     "start": "node src/server.js"
   },
   "repository": {
