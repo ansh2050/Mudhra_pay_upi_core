@@ -3,6 +3,7 @@
 const fs = require('fs');
 const path = require('path');
 const { Pool } = require('pg');
+require('dotenv').config();
 
 async function runMigrations() {
   console.log('🚀 Starting Mudhra_pay database migration...');
