@@ -1,5 +1,6 @@
 'use strict';
 
+require('./pgTypes');
 require('dotenv').config();
 const { Pool, types } = require('pg');
 
